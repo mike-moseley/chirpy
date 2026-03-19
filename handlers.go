@@ -31,11 +31,17 @@ func (cfg *apiConfig) handlerMetrics(w http.ResponseWriter, req *http.Request) {
 }
 
 func (cfg *apiConfig) handlerReset(w http.ResponseWriter, req *http.Request) {
+	if cfg.platform != "dev" {
+		respondWithError(w, 403, "Forbidden")
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 
 	cfg.fileserverHits.Store(0)
-	resetStr := "File server hits reset to 0\n"
+	cfg.db.DeleteAllUsers(req.Context())
+	resetStr := "File server hits reset to 0\nUsers deleted\n"
 
 	w.Write([]byte(resetStr))
 }
@@ -103,4 +109,34 @@ func replaceProfane(body string) string {
 		}
 	}
 	return cleanedBody
+}
+
+func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request) {
+	type parameters struct {
+		Email string
+	}
+
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error decoding user: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	dbUser, err := cfg.db.CreateUser(req.Context(), params.Email)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error creating user: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+
+	user := User{
+		ID:        dbUser.ID,
+		CreatedAt: dbUser.CreatedAt,
+		UpdatedAt: dbUser.UpdatedAt,
+		Email:     dbUser.Email,
+	}
+
+	respondWithJSON(w, 201, user)
 }
