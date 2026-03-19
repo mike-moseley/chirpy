@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/mike-moseley/chirpy/internal/auth"
 	"github.com/mike-moseley/chirpy/internal/database"
 )
 
@@ -90,7 +91,8 @@ func replaceProfane(body string) string {
 
 func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request) {
 	type parameters struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -101,7 +103,13 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request
 		respondWithError(w, 500, errMsg)
 		return
 	}
-	dbUser, err := cfg.db.CreateUser(req.Context(), params.Email)
+	hashedPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error decoding user: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	dbUser, err := cfg.db.CreateUser(req.Context(), database.CreateUserParams{Email: params.Email, HashedPassword: hashedPassword})
 	if err != nil {
 		errMsg := fmt.Sprintf("Error creating user: %s", err)
 		respondWithError(w, 500, errMsg)
@@ -130,6 +138,7 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, req *http.Reques
 	if err != nil {
 		errMsg := fmt.Sprintf("Error decoding chirp: %s", err)
 		respondWithError(w, 500, errMsg)
+		return
 	}
 	if len(params.Body) > 140 {
 		respondWithError(w, 400, "Chirp is too long")
@@ -140,6 +149,7 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, req *http.Reques
 	if err != nil {
 		errMsg := fmt.Sprintf("Error creating chirp: %s", err)
 		respondWithError(w, 500, errMsg)
+		return
 	}
 	chirp := Chirp{
 		ID:        dbChirp.ID,
@@ -150,4 +160,90 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, req *http.Reques
 	}
 
 	respondWithJSON(w, 201, chirp)
+}
+
+func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, req *http.Request) {
+	dbChirps, err := cfg.db.GetChirps(req.Context())
+	if err != nil {
+		errMsg := fmt.Sprintf("Error getting chirps: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	chirps := make([]Chirp, len(dbChirps))
+	for i, dbChirp := range dbChirps {
+		chirps[i] = Chirp{
+			ID:        dbChirp.ID,
+			CreatedAt: dbChirp.CreatedAt,
+			UpdatedAt: dbChirp.UpdatedAt,
+			Body:      dbChirp.Body,
+			UserID:    dbChirp.UserID,
+		}
+	}
+	respondWithJSON(w, 200, chirps)
+}
+
+func (cfg *apiConfig) handlerGetChirpByID(w http.ResponseWriter, req *http.Request) {
+	chirpID := req.PathValue("chirpID")
+	chirpUUID, err := uuid.Parse(chirpID)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error converting string to UUID: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	dbChirp, err := cfg.db.GetChirpByID(req.Context(), chirpUUID)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error getting chirps: %s", err)
+		respondWithError(w, 404, errMsg)
+		return
+	}
+
+	chirp := Chirp{
+		ID:        dbChirp.ID,
+		CreatedAt: dbChirp.CreatedAt,
+		UpdatedAt: dbChirp.UpdatedAt,
+		Body:      dbChirp.Body,
+		UserID:    dbChirp.UserID,
+	}
+
+	respondWithJSON(w, 200, chirp)
+}
+
+func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, req *http.Request) {
+	type parameters struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error decoding username and password: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	dbHashedPass, err := cfg.db.GetHashedPass(req.Context(), params.Email)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error decoding username and password: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	result, err := auth.CheckPasswordHash(params.Password, dbHashedPass)
+	if !result || err != nil {
+		errMsg := "Incorrect email or password"
+		respondWithError(w, 401, errMsg)
+		return
+	}
+	userJson, err := cfg.db.GetUser(req.Context(), params.Email)
+	if err != nil {
+		errMsg := "Incorrect email or password"
+		respondWithError(w, 401, errMsg)
+		return
+	}
+	user := User{
+		ID:        userJson.ID,
+		CreatedAt: userJson.CreatedAt,
+		UpdatedAt: userJson.UpdatedAt,
+		Email:     userJson.Email,
+	}
+	respondWithJSON(w, 200, user)
 }
