@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -118,10 +120,11 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request
 	}
 
 	user := User{
-		ID:        dbUser.ID,
-		CreatedAt: dbUser.CreatedAt,
-		UpdatedAt: dbUser.UpdatedAt,
-		Email:     dbUser.Email,
+		ID:          dbUser.ID,
+		CreatedAt:   dbUser.CreatedAt,
+		UpdatedAt:   dbUser.UpdatedAt,
+		Email:       dbUser.Email,
+		IsChirpyRed: dbUser.IsChirpyRed,
 	}
 
 	respondWithJSON(w, 201, user)
@@ -175,11 +178,25 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, req *http.Reques
 }
 
 func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, req *http.Request) {
-	dbChirps, err := cfg.db.GetChirps(req.Context())
-	if err != nil {
-		errMsg := fmt.Sprintf("Error getting chirps: %s", err)
+	s := req.URL.Query().Get("author_id")
+	userID, err := uuid.Parse(s)
+	if s != "" && err != nil {
+		errMsg := fmt.Sprintf("Error parsing user id: %s", err)
 		respondWithError(w, 500, errMsg)
 		return
+	}
+
+	var dbChirps []database.Chirp
+	if s != "" {
+		dbChirps, err = cfg.db.GetChirpsByUserID(req.Context(), userID)
+	} else {
+		dbChirps, err = cfg.db.GetChirps(req.Context())
+		if err != nil {
+			errMsg := fmt.Sprintf("Error getting chirps: %s", err)
+			respondWithError(w, 500, errMsg)
+			return
+		}
+
 	}
 	chirps := make([]Chirp, len(dbChirps))
 	for i, dbChirp := range dbChirps {
@@ -190,6 +207,13 @@ func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, req *http.Request)
 			Body:      dbChirp.Body,
 			UserID:    dbChirp.UserID,
 		}
+	}
+	sortQuery := req.URL.Query().Get("sort")
+	switch sortQuery {
+	case "asc":
+		sort.Slice(chirps, func(i, j int) bool { return chirps[i].CreatedAt.Before(chirps[j].CreatedAt) })
+	case "desc":
+		sort.Slice(chirps, func(i, j int) bool { return chirps[j].CreatedAt.Before(chirps[i].CreatedAt) })
 	}
 	respondWithJSON(w, 200, chirps)
 }
@@ -274,6 +298,7 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, req *http.Request) {
 		Email:        userJson.Email,
 		AccessToken:  accessToken,
 		RefreshToken: refresh,
+		IsChirpyRed:  userJson.IsChirpyRed,
 	}
 	respondWithJSON(w, 200, login)
 }
@@ -393,10 +418,11 @@ func (cfg *apiConfig) handlerUpdateUser(w http.ResponseWriter, req *http.Request
 	err = cfg.db.UpdateUserEmailPassword(req.Context(), database.UpdateUserEmailPasswordParams{ID: user.ID, Email: params.Email, HashedPassword: hashedPass})
 
 	newUser := User{
-		ID:        user.ID,
-		Email:     params.Email,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: time.Now(),
+		ID:          user.ID,
+		Email:       params.Email,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   time.Now(),
+		IsChirpyRed: user.IsChirpyRed,
 	}
 	respondWithJSON(w, 200, newUser)
 }
@@ -440,6 +466,54 @@ func (cfg *apiConfig) handlerDeleteChirpByID(w http.ResponseWriter, req *http.Re
 	if err != nil {
 		errMsg := fmt.Sprintf("Chirp not found in database: %v", err)
 		respondWithError(w, 404, errMsg)
+		return
+	}
+	respondWithJSON(w, 204, nil)
+}
+
+func (cfg *apiConfig) handlerPolka(w http.ResponseWriter, req *http.Request) {
+	events := []string{"user.upgraded"}
+	type parameters struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID uuid.UUID `json:"user_id"`
+		} `json:"data"`
+	}
+	apiKey, err := auth.GetAPIKey(req.Header)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error getting API key: %s", err)
+		respondWithError(w, 401, errMsg)
+		return
+	}
+	if apiKey != cfg.polkaKey {
+		respondWithError(w, 401, "Incorrect Polka API Key")
+		return
+	}
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err = decoder.Decode(&params)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error decoding polka webhook: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	// Trying to predict having to add features...
+	if !slices.Contains(events, params.Event) {
+		respondWithJSON(w, 204, nil)
+		return
+	}
+	switch params.Event {
+	case "user.upgraded":
+		{
+			err := cfg.db.MakeChirpyRed(req.Context(), params.Data.UserID)
+			if err != nil {
+				errMsg := fmt.Sprintf("Error user not found: %s", err)
+				respondWithError(w, 404, errMsg)
+				return
+			}
+		}
+	default:
+		// Do not acknowledge web hook exits
 		return
 	}
 	respondWithJSON(w, 204, nil)
