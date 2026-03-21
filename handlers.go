@@ -400,3 +400,47 @@ func (cfg *apiConfig) handlerUpdateUser(w http.ResponseWriter, req *http.Request
 	}
 	respondWithJSON(w, 200, newUser)
 }
+
+func (cfg *apiConfig) handlerDeleteChirpByID(w http.ResponseWriter, req *http.Request) {
+	headerToken := req.Header.Get("Authorization")
+	if headerToken == "" {
+		respondWithError(w, 401, "No refresh token received")
+		return
+	}
+	headerToken, found := strings.CutPrefix(headerToken, "Bearer ")
+	if found == false {
+		respondWithError(w, 403, "Malformed token received")
+		return
+	}
+	userID, err := auth.ValidateJWT(headerToken, cfg.secret)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error validating token: %s", err)
+		respondWithError(w, 401, errMsg)
+		return
+	}
+
+	chirpID := req.PathValue("chirpID")
+	chirpUUID, err := uuid.Parse(chirpID)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error converting string to UUID: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	dbChirp, err := cfg.db.GetChirpByID(req.Context(), chirpUUID)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error getting chirps: %s", err)
+		respondWithError(w, 404, errMsg)
+		return
+	}
+	if dbChirp.UserID != userID {
+		respondWithError(w, 403, "Cannot delete another user's chirp")
+		return
+	}
+	err = cfg.db.DeleteChirpByID(req.Context(), chirpUUID)
+	if err != nil {
+		errMsg := fmt.Sprintf("Chirp not found in database: %v", err)
+		respondWithError(w, 404, errMsg)
+		return
+	}
+	respondWithJSON(w, 204, nil)
+}
