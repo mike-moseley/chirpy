@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/mike-moseley/chirpy/internal/auth"
@@ -128,13 +129,24 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request
 
 func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, req *http.Request) {
 	type parameters struct {
-		Body   string        `json:"body"`
-		UserID uuid.NullUUID `json:"user_id"`
+		Body string `json:"body"`
+	}
+	bearerToken, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error getting token: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	userID, err := auth.ValidateJWT(bearerToken, cfg.secret)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error authenticating: %s", err)
+		respondWithError(w, 401, errMsg)
+		return
 	}
 
 	decoder := json.NewDecoder(req.Body)
 	params := parameters{}
-	err := decoder.Decode(&params)
+	err = decoder.Decode(&params)
 	if err != nil {
 		errMsg := fmt.Sprintf("Error decoding chirp: %s", err)
 		respondWithError(w, 500, errMsg)
@@ -145,7 +157,7 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, req *http.Reques
 		return
 	}
 	cleanedBody := replaceProfane(params.Body)
-	dbChirp, err := cfg.db.CreateChirp(req.Context(), database.CreateChirpParams{Body: cleanedBody, UserID: params.UserID})
+	dbChirp, err := cfg.db.CreateChirp(req.Context(), database.CreateChirpParams{Body: cleanedBody, UserID: userID})
 	if err != nil {
 		errMsg := fmt.Sprintf("Error creating chirp: %s", err)
 		respondWithError(w, 500, errMsg)
@@ -239,11 +251,152 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, req *http.Request) {
 		respondWithError(w, 401, errMsg)
 		return
 	}
-	user := User{
-		ID:        userJson.ID,
-		CreatedAt: userJson.CreatedAt,
-		UpdatedAt: userJson.UpdatedAt,
-		Email:     userJson.Email,
+	accessToken, err := auth.MakeJWT(userJson.ID, cfg.secret)
+	if err != nil {
+		errMsg := "Incorrect email or password"
+		respondWithError(w, 401, errMsg)
+		return
 	}
-	respondWithJSON(w, 200, user)
+	refresh := auth.MakeRefreshToken()
+
+	err = cfg.db.CreateRefreshToken(req.Context(), database.CreateRefreshTokenParams{
+		Token:  refresh,
+		UserID: userJson.ID,
+	})
+	if err != nil {
+		errMsg := "Error creating refresh token"
+		respondWithError(w, 401, errMsg)
+		return
+	}
+
+	login := loginResponse{
+		ID:           userJson.ID,
+		Email:        userJson.Email,
+		AccessToken:  accessToken,
+		RefreshToken: refresh,
+	}
+	respondWithJSON(w, 200, login)
+}
+
+func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, req *http.Request) {
+	headerToken := req.Header.Get("Authorization")
+	if headerToken == "" {
+		respondWithError(w, 401, "No refresh token received")
+		return
+	}
+	headerToken, found := strings.CutPrefix(headerToken, "Bearer ")
+	if found == false {
+		respondWithError(w, 401, "Malformed token received")
+		return
+	}
+	refreshToken, err := cfg.db.GetRefreshToken(req.Context(), headerToken)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error getting refresh token from database: %v", err)
+		respondWithError(w, 401, errMsg)
+		return
+	}
+	if refreshToken.RevokedAt.Valid == true {
+		respondWithError(w, 401, "Refresh token has been revoked")
+		return
+	}
+	if refreshToken.ExpiresAt.Before(time.Now()) {
+		respondWithError(w, 401, "Refresh token has expired")
+		return
+	}
+	user, err := cfg.db.GetUserFromRefreshToken(req.Context(), refreshToken.Token)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error getting user from database: %v", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	newToken, err := auth.MakeJWT(user.ID, cfg.secret)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error creating new access token: %v", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	jsonToken := struct {
+		Token string `json:"token"`
+	}{Token: newToken}
+	respondWithJSON(w, 200, jsonToken)
+}
+func (cfg *apiConfig) handlerRevoke(w http.ResponseWriter, req *http.Request) {
+	headerToken := req.Header.Get("Authorization")
+	if headerToken == "" {
+		respondWithError(w, 401, "No refresh token received")
+		return
+	}
+	headerToken, found := strings.CutPrefix(headerToken, "Bearer ")
+	if found == false {
+		respondWithError(w, 401, "Malformed token received")
+		return
+	}
+
+	token, err := cfg.db.GetRefreshToken(req.Context(), headerToken)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error getting refresh token from database: %v", err)
+		respondWithError(w, 401, errMsg)
+		return
+	}
+
+	err = cfg.db.RevokeResfreshToken(req.Context(), token.Token)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error revoking refresh token: %v", err)
+		respondWithError(w, 401, errMsg)
+		return
+	}
+	respondWithJSON(w, 204, nil)
+}
+
+func (cfg *apiConfig) handlerUpdateUser(w http.ResponseWriter, req *http.Request) {
+	headerToken := req.Header.Get("Authorization")
+	if headerToken == "" {
+		respondWithError(w, 401, "No refresh token received")
+		return
+	}
+	headerToken, found := strings.CutPrefix(headerToken, "Bearer ")
+	if found == false {
+		respondWithError(w, 401, "Malformed token received")
+		return
+	}
+	userID, err := auth.ValidateJWT(headerToken, cfg.secret)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error validating token: %s", err)
+		respondWithError(w, 401, errMsg)
+		return
+	}
+	user, err := cfg.db.GetUserByID(req.Context(), userID)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error getting user from database: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+
+	type parameters struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err = decoder.Decode(&params)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error decoding username and password: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	hashedPass, err := auth.HashPassword(params.Password)
+	if err != nil {
+		errMsg := fmt.Sprintf("Error hashing password: %s", err)
+		respondWithError(w, 500, errMsg)
+		return
+	}
+	err = cfg.db.UpdateUserEmailPassword(req.Context(), database.UpdateUserEmailPasswordParams{ID: user.ID, Email: params.Email, HashedPassword: hashedPass})
+
+	newUser := User{
+		ID:        user.ID,
+		Email:     params.Email,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: time.Now(),
+	}
+	respondWithJSON(w, 200, newUser)
 }
